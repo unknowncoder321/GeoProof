@@ -1,27 +1,38 @@
-//! Turns detected audio onsets into per-click frame positions and gaps.
+//! Turns detected audio onsets into per-click frame positions and gaps, and
+//! filters them against the user's learned click sound.
 //!
 //! A click's `frame` is the video frame whose presentation interval contains
 //! the click sound, and `subframe` is how far into that interval it lands
 //! (0.0 = start, 1.0 = end). These are measurements of the recording, not
 //! verdicts; capture jitter and dropped frames limit what they can prove.
 
-use crate::detect::Onset;
+use crate::detect::{similarity, Onset, Signature};
 use crate::media::MediaInfo;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClickEvent {
+    /// Ordinal among accepted clicks.
     pub index: usize,
+    /// Stable id: position in the full candidate list.
+    #[serde(skip)]
+    pub cand_id: usize,
     /// Seconds on the video timeline (audio time plus stream start offset).
     pub t_video_s: f64,
     pub frame: u64,
     /// Position inside the frame, 0.0..1.0.
     pub subframe: f64,
-    /// Time since the previous click.
+    /// Time since the previous accepted click.
     pub gap_ms: Option<f64>,
     /// Same gap expressed in video frames (fractional).
     pub gap_frames: Option<f64>,
     pub strength: f32,
+    /// Match to the learned click sound, when one exists.
+    pub similarity: Option<f32>,
+    #[serde(skip)]
+    pub accepted: bool,
+    #[serde(skip)]
+    pub sig: Option<Signature>,
 }
 
 pub fn map_to_frames(onsets: &[Onset], info: &MediaInfo) -> Vec<ClickEvent> {
@@ -41,22 +52,68 @@ pub fn map_to_frames(onsets: &[Onset], info: &MediaInfo) -> Vec<ClickEvent> {
             }
             None => (None, None),
         };
+        let id = events.len();
         events.push(ClickEvent {
-            index: events.len(),
+            index: id,
+            cand_id: id,
             t_video_s: t,
             frame: frame as u64,
             subframe: pos - frame,
             gap_ms,
             gap_frames,
             strength: o.strength,
+            similarity: None,
+            accepted: true,
+            sig: o.sig,
         });
     }
     events
 }
 
+/// Scores every candidate against `template` and returns the accepted clicks,
+/// renumbered, with gaps recomputed between accepted clicks only. With no
+/// template every candidate is accepted.
+pub fn apply_filter(
+    cands: &mut [ClickEvent],
+    template: Option<&Signature>,
+    min_sim: f32,
+    fps: f64,
+) -> Vec<ClickEvent> {
+    let mut out: Vec<ClickEvent> = Vec::with_capacity(cands.len());
+    for c in cands.iter_mut() {
+        c.similarity = match (template, &c.sig) {
+            (Some(t), Some(s)) => Some(similarity(t, s)),
+            _ => None,
+        };
+        c.accepted = match (template, c.similarity) {
+            (Some(_), Some(sim)) => sim >= min_sim,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if c.accepted {
+            let mut e = c.clone();
+            e.index = out.len();
+            match out.last() {
+                Some(prev) => {
+                    let dt = e.t_video_s - prev.t_video_s;
+                    e.gap_ms = Some(dt * 1000.0);
+                    e.gap_frames = Some(dt * fps);
+                }
+                None => {
+                    e.gap_ms = None;
+                    e.gap_frames = None;
+                }
+            }
+            out.push(e);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::detect::SIG_BANDS;
 
     fn info(fps: f64, audio_start: f64) -> MediaInfo {
         MediaInfo {
@@ -72,7 +129,7 @@ mod tests {
     }
 
     fn onset(t: f64) -> Onset {
-        Onset { t, flux: 1.0, thr: 0.5, strength: 10.0 }
+        Onset { t, flux: 1.0, thr: 0.5, strength: 10.0, sig: None }
     }
 
     #[test]
@@ -91,5 +148,24 @@ mod tests {
         let ev = map_to_frames(&[onset(1.0)], &info(60.0, 0.5));
         assert!((ev[0].t_video_s - 1.5).abs() < 1e-9);
         assert_eq!(ev[0].frame, 90);
+    }
+
+    #[test]
+    fn filter_keeps_only_matching_clicks() {
+        let mut a = [0.0f32; SIG_BANDS];
+        a[0] = 1.0;
+        let mut b = [0.0f32; SIG_BANDS];
+        b[1] = 1.0;
+        let mut on = vec![onset(1.0), onset(1.1), onset(1.2)];
+        on[0].sig = Some(a);
+        on[1].sig = Some(b);
+        on[2].sig = Some(a);
+        let mut cands = map_to_frames(&on, &info(60.0, 0.0));
+        let kept = apply_filter(&mut cands, Some(&a), 0.9, 60.0);
+        assert_eq!(kept.len(), 2);
+        assert!((kept[1].gap_ms.unwrap() - 200.0).abs() < 1e-6);
+        assert!(!cands[1].accepted);
+        let all = apply_filter(&mut cands, None, 0.9, 60.0);
+        assert_eq!(all.len(), 3);
     }
 }

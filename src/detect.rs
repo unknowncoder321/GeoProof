@@ -3,9 +3,10 @@
 //!
 //! Pipeline: 2x biquad high-pass -> log-spectral flux in [f_lo, f_hi] ->
 //! adaptive median/MAD threshold -> peak picking with a refractory gap ->
-//! sample-domain onset refinement.
+//! sample-domain onset refinement -> click-sound signature (see proto/sig.py).
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
+use std::sync::Arc;
 
 const N_FFT: usize = 512;
 const HOP: usize = 128;
@@ -18,6 +19,15 @@ const REFINE_BEFORE_S: f64 = 0.012;
 const REFINE_AFTER_S: f64 = 0.006;
 const ENV_SMOOTH_S: f64 = 0.0004;
 const ONSET_FRAC: f32 = 0.20;
+const PROGRESS_EVERY: usize = 2048;
+
+pub const SIG_BANDS: usize = 16;
+const SIG_WIN: usize = 512;
+const SIG_F_MIN: f64 = 500.0;
+const SIG_F_MAX: f64 = 12000.0;
+
+/// What a click adds on top of the music: a 16-band spectral shape, unit length.
+pub type Signature = [f32; SIG_BANDS];
 
 #[derive(Debug, Clone)]
 pub struct Params {
@@ -41,10 +51,14 @@ impl Default for Params {
 pub struct Onset {
     /// Seconds from the start of the audio stream.
     pub t: f64,
+    #[allow(dead_code)]
     pub flux: f32,
+    #[allow(dead_code)]
     pub thr: f32,
     /// Peak envelope over the local noise floor; a rough confidence signal.
     pub strength: f32,
+    /// Spectral shape of this click, for matching against the user's click sound.
+    pub sig: Option<Signature>,
 }
 
 struct Biquad {
@@ -89,6 +103,12 @@ fn highpass(x: &[f32], sr: f64) -> Vec<f32> {
     x.iter().map(|&v| s2.process(s1.process(v as f64)) as f32).collect()
 }
 
+fn hann(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos())
+        .collect()
+}
+
 fn median(v: &mut [f32]) -> f32 {
     if v.is_empty() {
         return 0.0;
@@ -102,7 +122,13 @@ fn median(v: &mut [f32]) -> f32 {
     }
 }
 
-fn log_spectral_flux(hp: &[f32], sr: f64, f_lo: f32, f_hi: f32) -> Vec<f32> {
+fn log_spectral_flux(
+    hp: &[f32],
+    sr: f64,
+    f_lo: f32,
+    f_hi: f32,
+    progress: &mut dyn FnMut(f32),
+) -> Vec<f32> {
     if hp.len() < N_FFT {
         return Vec::new();
     }
@@ -113,15 +139,16 @@ fn log_spectral_flux(hp: &[f32], sr: f64, f_lo: f32, f_hi: f32) -> Vec<f32> {
         return vec![0.0; n_frames];
     }
 
-    let window: Vec<f32> = (0..N_FFT)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (N_FFT as f32 - 1.0)).cos())
-        .collect();
+    let window = hann(N_FFT);
     let fft = FftPlanner::<f32>::new().plan_fft_forward(N_FFT);
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); N_FFT];
     let mut prev: Vec<f32> = vec![0.0; k_hi - k_lo];
     let mut flux = vec![0.0f32; n_frames];
 
     for t in 0..n_frames {
+        if t % PROGRESS_EVERY == 0 {
+            progress(t as f32 / n_frames as f32);
+        }
         let seg = &hp[t * HOP..t * HOP + N_FFT];
         for i in 0..N_FFT {
             buf[i] = Complex::new(seg[i] * window[i], 0.0);
@@ -227,21 +254,125 @@ fn refine(hp: &[f32], frame_idx: usize, sr: f64) -> (f64, f32) {
     ((a + idx) as f64 / sr, env[peak_i] / (floor + 1e-9))
 }
 
-pub fn detect(audio: &[f32], sr: f64, p: &Params) -> Vec<Onset> {
+struct SigCtx {
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    edges: [usize; SIG_BANDS + 1],
+}
+
+impl SigCtx {
+    fn new(sr: f64) -> Self {
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(SIG_WIN);
+        let mut edges = [0usize; SIG_BANDS + 1];
+        for k in 0..=SIG_BANDS {
+            let f = SIG_F_MIN * (SIG_F_MAX / SIG_F_MIN).powf(k as f64 / SIG_BANDS as f64);
+            edges[k] = ((f * SIG_WIN as f64 / sr).round() as usize).clamp(1, SIG_WIN / 2);
+        }
+        SigCtx { fft, window: hann(SIG_WIN), edges }
+    }
+
+    fn magnitudes(&self, seg: &[f32]) -> Vec<f32> {
+        let mut buf: Vec<Complex<f32>> = seg
+            .iter()
+            .zip(self.window.iter())
+            .map(|(&s, &w)| Complex::new(s * w, 0.0))
+            .collect();
+        self.fft.process(&mut buf);
+        buf.iter().take(SIG_WIN / 2 + 1).map(|c| c.norm()).collect()
+    }
+
+    /// Post-onset spectrum minus pre-onset spectrum (half-wave), pooled into log bands.
+    fn at(&self, audio: &[f32], onset_s: f64, sr: f64) -> Option<Signature> {
+        let i = (onset_s * sr).round() as usize;
+        if i < SIG_WIN + 96 || i + SIG_WIN - 48 > audio.len() {
+            return None;
+        }
+        let post = self.magnitudes(&audio[i - 48..i - 48 + SIG_WIN]);
+        let pre = self.magnitudes(&audio[i - SIG_WIN - 96..i - 96]);
+        let mut v = [0.0f32; SIG_BANDS];
+        for k in 0..SIG_BANDS {
+            let lo = self.edges[k];
+            let hi = self.edges[k + 1].max(lo + 1).min(post.len());
+            let mut e = 0.0f32;
+            for b in lo..hi {
+                let d = (post[b] - pre[b]).max(0.0);
+                e += d * d;
+            }
+            v[k] = (30.0 * e.sqrt()).ln_1p();
+        }
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n <= 1e-9 {
+            return None;
+        }
+        for x in v.iter_mut() {
+            *x /= n;
+        }
+        Some(v)
+    }
+}
+
+/// Cosine similarity of two unit-length signatures.
+pub fn similarity(a: &Signature, b: &Signature) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Average several signatures into one unit-length template.
+pub fn mean_signature(sigs: &[Signature]) -> Option<Signature> {
+    if sigs.is_empty() {
+        return None;
+    }
+    let mut m = [0.0f32; SIG_BANDS];
+    for s in sigs {
+        for k in 0..SIG_BANDS {
+            m[k] += s[k];
+        }
+    }
+    let n = m.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n <= 1e-9 {
+        return None;
+    }
+    for x in m.iter_mut() {
+        *x /= n;
+    }
+    Some(m)
+}
+
+pub fn detect_with_progress(
+    audio: &[f32],
+    sr: f64,
+    p: &Params,
+    progress: &mut dyn FnMut(f32),
+) -> Vec<Onset> {
+    progress(0.0);
     let hp = highpass(audio, sr);
-    let flux = log_spectral_flux(&hp, sr, p.f_lo, p.f_hi);
+    let flux = {
+        let mut flux_progress = |f: f32| progress(0.05 + 0.80 * f);
+        log_spectral_flux(&hp, sr, p.f_lo, p.f_hi, &mut flux_progress)
+    };
     if flux.is_empty() {
         return Vec::new();
     }
     let hop_s = HOP as f64 / sr;
     let thr = local_threshold(&flux, hop_s, p.k);
-    pick_peaks(&flux, &thr, hop_s, p.min_gap_s)
-        .into_iter()
-        .map(|i| {
-            let (t, strength) = refine(&hp, i, sr);
-            Onset { t, flux: flux[i], thr: thr[i], strength }
-        })
-        .collect()
+    progress(0.88);
+    let peaks = pick_peaks(&flux, &thr, hop_s, p.min_gap_s);
+    let sig_ctx = SigCtx::new(sr);
+    let total = peaks.len().max(1);
+    let mut out = Vec::with_capacity(peaks.len());
+    for (n, i) in peaks.into_iter().enumerate() {
+        let (t, strength) = refine(&hp, i, sr);
+        out.push(Onset { t, flux: flux[i], thr: thr[i], strength, sig: sig_ctx.at(audio, t, sr) });
+        if n % 64 == 0 {
+            progress(0.88 + 0.12 * n as f32 / total as f32);
+        }
+    }
+    progress(1.0);
+    out
+}
+
+#[allow(dead_code)]
+pub fn detect(audio: &[f32], sr: f64, p: &Params) -> Vec<Onset> {
+    detect_with_progress(audio, sr, p, &mut |_f: f32| {})
 }
 
 #[cfg(test)]
@@ -271,11 +402,21 @@ mod tests {
         let found = detect(&x, sr, &Params::default());
         assert_eq!(found.len(), 1, "expected exactly one click, got {}", found.len());
         assert!((found[0].t - click_at).abs() < 0.003, "onset off by {} s", found[0].t - click_at);
+        assert!(found[0].sig.is_some(), "click should carry a signature");
     }
 
     #[test]
     fn silence_has_no_clicks() {
         let x = vec![0.0f32; 48_000 * 2];
         assert!(detect(&x, 48_000.0, &Params::default()).is_empty());
+    }
+
+    #[test]
+    fn signature_matches_itself() {
+        let mut a = [0.0f32; SIG_BANDS];
+        a[3] = 3.0;
+        a[4] = 4.0;
+        let t = mean_signature(&[a]).unwrap();
+        assert!((similarity(&t, &t) - 1.0).abs() < 1e-5);
     }
 }

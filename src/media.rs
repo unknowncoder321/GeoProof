@@ -1,4 +1,4 @@
-//! Video probing and audio extraction via ffmpeg/ffprobe subprocesses.
+//! Video probing, audio extraction and single-frame extraction via ffmpeg/ffprobe.
 //!
 //! ffmpeg/ffprobe are looked up next to the executable first (bundled build),
 //! then on PATH.
@@ -170,4 +170,33 @@ pub fn decode_audio(path: &Path) -> Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect())
+}
+
+/// Decode the frame at `time_s` (video timeline) to RGBA, scaled to `width` pixels wide.
+/// Returns (width, height, rgba bytes).
+pub fn extract_frame(path: &Path, time_s: f64, info: &MediaInfo, width: usize) -> Result<(usize, usize, Vec<u8>)> {
+    if info.width == 0 || info.height == 0 {
+        bail!("unknown video size");
+    }
+    let w = width.max(2) & !1;
+    let h = (((w as f64) * info.height as f64 / info.width as f64 / 2.0).round() as usize * 2).max(2);
+    let out = command("ffmpeg")
+        .args(["-v", "error", "-ss"])
+        .arg(format!("{:.4}", time_s.max(0.0)))
+        .arg("-i")
+        .arg(path)
+        .args(["-frames:v", "1", "-an", "-vf"])
+        .arg(format!("scale={w}:{h}:flags=bicubic"))
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("could not run ffmpeg")?;
+    if !out.status.success() {
+        bail!("ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    if out.stdout.len() != w * h * 4 {
+        bail!("frame decode returned {} bytes, expected {}", out.stdout.len(), w * h * 4);
+    }
+    Ok((w, h, out.stdout))
 }
