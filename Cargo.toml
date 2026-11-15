@@ -1,0 +1,20 @@
+[package]
+name = "geoproof"
+version = "0.1.0"
+edition = "2021"
+description = "Click timing analysis for Geometry Dash completion recordings"
+
+[dependencies]
+eframe = "0.29"
+egui_extras = "0.29"
+egui_plot = "0.29"
+rfd = "0.15"
+rustfft = "6"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
