@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geoproof-exe
+          path: target/release/geoproof.exe
+      - name: Bundle with ffmpeg
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg
+          $bin = Get-ChildItem -Path ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/geoproof.exe dist/
+          Copy-Item $bin.FullName dist/
+          Copy-Item (Join-Path $bin.DirectoryName ffprobe.exe) dist/
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('dist/ffmpeg.exe') != ''
+        with:
+          name: geoproof-bundle
+          path: dist
+
+  prototype:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install numpy scipy
+      - run: python3 proto/test.py
